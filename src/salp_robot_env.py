@@ -93,6 +93,11 @@ class SalpRobotEnv(gym.Env):
         # Interactive control state
         self.current_coast_time = 0.5
         self.current_compression = 0.0
+
+        # Live robot-parameter panel (interactive control widget)
+        self._show_param_panel = True
+        self._params = None          # populated lazily in interactive_control()
+        self._selected_param = 0
         
         # Trajectory visualization
         self.target_point = None  # Current target point
@@ -1141,6 +1146,46 @@ class SalpRobotEnv(gym.Env):
         compression_text = small_font.render(f"Compression: {compression_pct:.1f}%", True, (255, 150, 100))
         self.screen.blit(compression_text, (10, 140))
 
+    def _draw_param_panel(self):
+        """Draw the live robot-parameter panel (interactive control widget)."""
+        if not self._params:
+            return
+        if not (hasattr(pygame, 'font') and pygame.font.get_init()):
+            pygame.font.init()
+
+        title_font = pygame.font.Font(None, 24)
+        row_font = pygame.font.Font(None, 22)
+
+        # Panel geometry (top-right corner)
+        pad = 10
+        line_h = 24
+        panel_w = 270
+        panel_h = pad * 2 + line_h * (len(self._params) + 2)
+        panel_x = self.width - panel_w - 10
+        panel_y = 10
+
+        # Semi-transparent background
+        panel = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+        panel.fill((0, 0, 0, 150))
+        self.screen.blit(panel, (panel_x, panel_y))
+
+        x = panel_x + pad
+        y = panel_y + pad
+        title = title_font.render("Robot Params  [P hide]", True, (255, 255, 255))
+        self.screen.blit(title, (x, y))
+        y += line_h
+        hint = row_font.render("TAB select   [ / ]  adjust   0 reset", True, (150, 150, 150))
+        self.screen.blit(hint, (x, y))
+        y += line_h
+
+        for i, p in enumerate(self._params):
+            selected = (i == self._selected_param)
+            value = p["get"]()
+            label = f"{'> ' if selected else '  '}{p['name']}: {value:{p['fmt']}} {p['unit']}"
+            color = (120, 230, 120) if selected else (210, 210, 210)
+            self.screen.blit(row_font.render(label, True, color), (x, y))
+            y += line_h
+
     def get_cycle_count(self) -> int:
         """Get the current cycle count from the robot."""
         return self.robot.cycle
@@ -1187,8 +1232,14 @@ class SalpRobotEnv(gym.Env):
         # draw cycle info overlay
         self._draw_cycle_info()
 
-        # Capture frame if recording
-        if self._recording and self.screen is not None:
+        # draw the live robot-parameter panel (interactive control widget)
+        if self._show_param_panel:
+            self._draw_param_panel()
+
+        # Capture frame if recording. Only capture while a cycle is animating so idle
+        # frames (waiting for the next input) don't bloat the GIF — this keeps the
+        # recording to the actual swimming motion.
+        if self._recording and self.screen is not None and not self._animation_complete:
             # Convert pygame surface to numpy array
             frame = pygame.surfarray.array3d(self.screen)
             # Transpose to correct orientation (width, height, channels) -> (height, width, channels)
@@ -1291,8 +1342,14 @@ class SalpRobotEnv(gym.Env):
         - R: Reset robot to starting position
         - N: Generate new target point
         - G: Start/stop GIF recording
+        - P: Toggle the robot-parameter panel
+        - TAB: Select next robot parameter
+        - [ / ]: Decrease/increase the selected robot parameter
+        - 0: Reset all robot parameters to defaults
         - Q or ESC: Quit
-        
+
+        The whole session is auto-recorded to a timestamped GIF in recordings/ on quit.
+
         Args:
             max_cycles: Maximum number of breathing cycles to run. 
                        If None, runs until user quits.
@@ -1323,13 +1380,54 @@ class SalpRobotEnv(gym.Env):
         print("  R             - Reset robot to start position")
         print("  N             - Generate new target point")
         print("  G             - Start/stop GIF recording")
+        print("  P             - Toggle robot-parameter panel")
+        print("  TAB           - Select next robot parameter")
+        print("  [ / ]         - Decrease/increase selected parameter")
+        print("  0             - Reset all parameters to defaults")
         print("  Q / ESC       - Quit interactive mode")
         print("\nCurrent State:")
         print("="*60 + "\n")
-        
+
+        # Build the live robot-parameter panel (data-driven so knobs are easy to add/remove).
+        # Defaults are captured from the robot the session was launched with.
+        r = self.robot
+        self._params = [
+            {"name": "Length", "unit": "m", "fmt": ".3f", "step": 0.01, "lo": 0.10, "hi": 0.45,
+             "get": (lambda: r.init_length), "set": (lambda v: setattr(r, "init_length", v))},
+            {"name": "Width", "unit": "m", "fmt": ".3f", "step": 0.005, "lo": 0.05, "hi": 0.25,
+             "get": (lambda: r.init_width), "set": (lambda v: setattr(r, "init_width", v))},
+            {"name": "Max contraction", "unit": "m", "fmt": ".3f", "step": 0.005, "lo": 0.005, "hi": 0.10,
+             "get": (lambda: r.max_contraction), "set": (lambda v: setattr(r, "max_contraction", v))},
+            {"name": "Water density", "unit": "kg/m3", "fmt": ".0f", "step": 25.0, "lo": 500.0, "hi": 1500.0,
+             "get": (lambda: r.density), "set": (lambda v: r.set_environment(density=v))},
+            {"name": "Nozzle area", "unit": "m2", "fmt": ".2e", "step": 2.5e-5, "lo": 5e-5, "hi": 1e-3,
+             "get": (lambda: r.nozzle.area), "set": (lambda v: setattr(r.nozzle, "area", v))},
+        ]
+        for p in self._params:
+            p["default"] = p["get"]()
+        self._selected_param = 0
+
+        def adjust_param(index, direction):
+            """Step a parameter by ±step, clamp, apply, and re-derive robot state."""
+            p = self._params[index]
+            new_val = float(np.clip(p["get"]() + direction * p["step"], p["lo"], p["hi"]))
+            p["set"](new_val)
+            self.reset()
+            print(f"✓ {p['name']}: {new_val:{p['fmt']}} {p['unit']}")
+
+        def reset_params():
+            for p in self._params:
+                p["set"](p["default"])
+            self.reset()
+            print("✓ Robot parameters reset to defaults")
+
+        # Auto-record the whole session (the G key can still save interim GIFs).
+        if not self._recording:
+            self.start_recording()
+
         running = True
         cycle_count = 0
-        
+
         while running:
             # Handle pygame events
             for event in pygame.event.get():
@@ -1359,6 +1457,21 @@ class SalpRobotEnv(gym.Env):
                             filepath = self.stop_recording()
                         else:
                             self.start_recording()
+                    elif event.key == pygame.K_p:
+                        # Toggle robot-parameter panel
+                        self._show_param_panel = not self._show_param_panel
+                    elif event.key == pygame.K_TAB:
+                        # Select next robot parameter
+                        self._selected_param = (self._selected_param + 1) % len(self._params)
+                    elif event.key == pygame.K_LEFTBRACKET:
+                        # Decrease selected parameter
+                        adjust_param(self._selected_param, -1)
+                    elif event.key == pygame.K_RIGHTBRACKET:
+                        # Increase selected parameter
+                        adjust_param(self._selected_param, +1)
+                    elif event.key == pygame.K_0:
+                        # Reset all robot parameters to defaults
+                        reset_params()
                     elif event.key == pygame.K_EQUALS or event.key == pygame.K_PLUS:
                         # Increase coast time
                         coast_time = min(1.0, coast_time + 0.1)
@@ -1468,21 +1581,21 @@ class SalpRobotEnv(gym.Env):
                     print(f"  Goal reached! Final distance: {np.linalg.norm(self.target_point - robot_pos):.3f} m")
                 elif truncated:
                     print(f"  Robot went out of bounds or reached maximum cycles")
-                
-                # Ask if user wants to continue
-                response = input("\nStart new episode? (y/n): ").strip().lower()
-                if response == 'y':
-                    obs, info = self.reset()
-                    cycle_count = 0
-                    print("✓ New episode started\n")
-                else:
-                    running = False
-            
+
+                # Auto-reset for a new episode (press Q/ESC to quit, N for a new target).
+                obs, info = self.reset()
+                cycle_count = 0
+                print("✓ New episode started\n")
+
             # Check max cycles limit
             if max_cycles is not None and cycle_count >= max_cycles:
                 print(f"\nReached maximum cycles ({max_cycles})")
                 running = False
         
+        # Save the full-session recording on a normal exit.
+        if self._recording:
+            self.stop_recording()
+
         print("\n" + "="*60)
         print("Exited interactive control mode")
         print("="*60)
